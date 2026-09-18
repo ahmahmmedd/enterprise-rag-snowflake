@@ -1,0 +1,13 @@
+# --- UI -----------------------------------------------------------------
+streamlit>=1.37.0
+
+# --- LangChain core + Snowflake partner package --------------------------
+langchain-core>=0.3.0
+langchain-snowflake>=0.1.0
+
+# --- Environment / config -------------------------------------------------
+python-dotenv>=1.0.1
+
+# --- Snowpark is pulled in transitively by langchain-snowflake, pinned
+#     explicitly here for reproducible builds --------------------------
+snowflake-snowpark-python>=1.20.0
