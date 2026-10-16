@@ -1,194 +1,271 @@
 """
 ============================================================================
  Enterprise Financial Document RAG Assistant
-----------------------------------------------------------------------------
- Architecture:  Streamlit (UI)  ->  LangChain (LCEL orchestration)
-                -> Snowflake Cortex Search (retrieval)
-                -> Snowflake Cortex / Claude 3.5 Sonnet (generation)
-
- Data-flow summary:
-   1. User types a question in the Streamlit chat box.
-   2. The question is passed, unmodified, into an LCEL chain.
-   3. The chain's `retriever` branch calls SnowflakeCortexSearchRetriever,
-      which performs a REST call to a pre-existing Cortex Search service
-      running INSIDE the Snowflake account boundary. The raw financial
-      documents never leave Snowflake -- only the top-k retrieved text
-      chunks are returned to this process.
-   4. The chain's `question` branch simply forwards the raw question
-      (RunnablePassthrough).
-   5. Both branches are merged into a single dict {"context": ..., "question": ...}
-      which is rendered by a ChatPromptTemplate into a grounded prompt.
-   6. The rendered prompt is sent to ChatSnowflake (Claude 3.5 Sonnet served
-      via Snowflake Cortex), which generates the final, context-grounded
-      answer.
-   7. The answer is streamed back to the Streamlit chat UI and appended to
-      session-state chat history.
-
- Because steps 3-6 all execute against Snowflake-hosted services (Cortex
- Search + Cortex LLM functions), sensitive financial data is never sent to
- an external, non-Snowflake API endpoint -- it stays within the customer's
- Snowflake governance boundary (RBAC, masking policies, audit logs, etc.)
- the entire time.
 ============================================================================
 """
 
 import os
 import sys
 import traceback
-
 import streamlit as st
 from dotenv import load_dotenv
 
-# --- LangChain core (framework-agnostic LCEL primitives) -------------------
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
-
-# --- LangChain <> Snowflake partner package ---------------------------------
-# create_session_from_env(): builds a snowflake.snowpark.Session from the
-#   standard SNOWFLAKE_* environment variables (see .env.example).
-# SnowflakeCortexSearchRetriever: LangChain Retriever backed by a Cortex
-#   Search service (hybrid keyword + vector search, fully managed by
-#   Snowflake -- no external vector DB required).
-# ChatSnowflake: LangChain Chat Model that invokes Snowflake Cortex's
-#   COMPLETE function, giving access to Claude 3.5 Sonnet (and other
-#   Cortex-hosted models) without the data or the prompt ever leaving
-#   Snowflake's network boundary.
 from langchain_snowflake import (
-    create_session_from_env,
     SnowflakeCortexSearchRetriever,
     ChatSnowflake,
 )
+from cryptography.hazmat.primitives import serialization
+from snowflake.snowpark import Session
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-load_dotenv()  # populate os.environ from a local .env file, if present
+load_dotenv()
 
-APP_TITLE = "Enterprise Financial Document Assistant"
-CORTEX_SEARCH_SERVICE = "FINANCE_DB.DATA.FINANCE_SEARCH"  # <db>.<schema>.<service>
+APP_TITLE = "Financial Intelligence"
+CORTEX_SEARCH_SERVICE = "FINANCE_DB.DATA.FINANCE_SEARCH"
 CHAT_MODEL = os.getenv("CORTEX_CHAT_MODEL", "claude-3-5-sonnet")
 RETRIEVER_K = 5
 MODEL_TEMPERATURE = 0.1
 
-# System prompt: the single most important guardrail in the whole app.
-# It forces the LLM to ground every answer in the retrieved context instead
-# of falling back on parametric knowledge -- critical for financial
-# accuracy and auditability.
 SYSTEM_PROMPT = """You are an expert financial research assistant embedded in a secure,
 enterprise-grade Retrieval-Augmented Generation (RAG) system.
 
-Your ONLY source of truth is the "Context" block below, which was retrieved
-from the organization's governed financial document repository in Snowflake.
-
-Rules you must follow at all times:
-1. Answer strictly and exclusively using the information contained in the Context.
-2. If the Context does not contain enough information to answer confidently,
-   say so explicitly (e.g. "The retrieved documents do not contain this information.").
-   Do NOT guess, speculate, or use outside/general knowledge.
-3. Never fabricate figures, dates, company names, or citations.
-4. When numbers, dates, or financial figures are present in the Context, quote
-   them precisely as written.
-5. Be concise, professional, and precise -- write as a financial analyst would.
-6. Where helpful, reference which part of the context (e.g. document/section)
-   supports your answer.
+Your ONLY source of truth is the "Context" block below. 
+Answer strictly and exclusively using the information contained in the Context.
+Be concise, professional, and precise.
 
 Context:
 {context}
 """
 
 # ============================================================================
-# STREAMLIT PAGE CONFIG
+# STREAMLIT PAGE CONFIG & AGENCY CSS
 # ============================================================================
 st.set_page_config(
     page_title=APP_TITLE,
-    page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+def inject_agency_css():
+    st.markdown("""
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..700;1,9..144,300..700&family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500&display=swap');
+
+        /* Global Font & Background Override */
+        html, body, [data-testid="stAppViewContainer"] {
+            font-family: 'Geist', sans-serif;
+            background-color: #06060D !important;
+            color: #F2EFEA !important;
+        }
+        
+        /* Protect Streamlit Icons from the font override */
+        .stIcon, .material-symbols-rounded, [data-testid="stSidebarCollapseButton"] *, [data-testid="collapsedControl"] * {
+            font-family: 'Material Symbols Rounded' !important;
+        }
+        
+        /* Hide Streamlit Clutter (Safely) */
+        #MainMenu {visibility: hidden;}
+        footer {visibility: hidden;}
+        
+        /* Keep the header functional but transparent, and explicitly color the toggle icon */
+        header {
+            background: transparent !important;
+        }
+        [data-testid="stSidebarCollapsedControl"] svg,
+        [data-testid="collapsedControl"] svg, 
+        .st-emotion-cache-1vt4ygl svg {
+            color: #F2EFEA !important;
+            fill: #F2EFEA !important;
+        }
+        
+        /* Add a subtle background to the toggle button so it stands out against the dark void */
+        [data-testid="collapsedControl"], 
+        [data-testid="stSidebarCollapsedControl"] {
+            background: rgba(20, 20, 28, 0.8) !important;
+            border: 1px solid rgba(255, 255, 255, 0.1) !important;
+            border-radius: 8px !important;
+            margin-top: 8px !important;
+            margin-left: 8px !important;
+            visibility: visible !important;
+        }
+
+        /* Agency Typography */
+        .eyebrow {
+            display: inline-flex;
+            align-items: center;
+            font-family: 'Geist Mono', monospace;
+            font-size: 11px;
+            letter-spacing: .18em;
+            text-transform: uppercase;
+            color: #8A8694;
+            padding: 6px 14px;
+            border: 1px solid rgba(255,255,255,.06);
+            border-radius: 100px;
+            margin-bottom: 24px;
+            background: rgba(255,255,255,.02);
+            backdrop-filter: blur(8px);
+        }
+        .s-title {
+            font-family: 'Fraunces', Georgia, serif;
+            font-weight: 300;
+            font-size: clamp(36px, 4vw, 56px);
+            line-height: 1.05;
+            letter-spacing: -.03em;
+            margin-top: 0;
+            padding-top: 0;
+            margin-bottom: 16px;
+        }
+        .s-title em {
+            font-style: italic;
+            font-weight: 300;
+            background: linear-gradient(90deg, #B45AFF 0%, #E095FF 50%, #B45AFF 100%);
+            background-size: 200% 100%;
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+            animation: textFlow 8s linear infinite;
+        }
+        @keyframes textFlow { to { background-position: 200% 0; } }
+        
+        .lead {
+            font-size: 17px;
+            line-height: 1.6;
+            color: #8A8694;
+            max-width: 60ch;
+            margin-bottom: 40px;
+        }
+        
+        /* Sidebar Restyling */
+        [data-testid="stSidebar"] {
+            border-right: 1px solid rgba(255,255,255,.04) !important;
+            background: #0A0A12 !important;
+        }
+        .sidebar-header {
+            font-family: 'Geist Mono', monospace;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: .15em;
+            color: #5A5664;
+            margin-top: 2rem;
+            margin-bottom: 1rem;
+            border-bottom: 1px solid rgba(255,255,255,.04);
+            padding-bottom: 8px;
+        }
+        .metric-value {
+            font-family: 'Geist Mono', monospace;
+            color: #B45AFF;
+            font-size: 13px;
+            margin-top: 4px;
+            margin-bottom: 16px;
+            display: block;
+        }
+        
+        /* Chat UI Restyling */
+        [data-testid="stChatMessage"] {
+            background-color: #0A0A12 !important;
+            border: 1px solid rgba(255,255,255,.04) !important;
+            border-radius: 16px !important;
+            padding: 24px !important;
+            margin-bottom: 16px !important;
+        }
+        [data-testid="stChatMessageAvatar"] {
+            background-color: #14141C !important;
+            color: #B45AFF !important;
+            border: 1px solid rgba(180,90,255,.2) !important;
+            border-radius: 8px !important;
+            font-family: 'Geist Mono', monospace !important;
+            font-size: 12px !important;
+        }
+        
+        /* Input Box */
+        [data-testid="stChatInput"] {
+            background-color: #0A0A12 !important;
+            border: 1px solid rgba(255,255,255,.08) !important;
+            border-radius: 12px !important;
+        }
+        
+        /* Buttons */
+        .stButton > button {
+            background: transparent !important;
+            color: #F2EFEA !important;
+            border-radius: 100px !important;
+            font-family: 'Geist Mono', monospace !important;
+            font-size: 12px !important;
+            letter-spacing: 0.05em !important;
+            text-transform: uppercase !important;
+            border: 1px solid rgba(255,255,255,.1) !important;
+            transition: all 220ms ease !important;
+        }
+        .stButton > button:hover {
+            border-color: #B45AFF !important;
+            color: #B45AFF !important;
+            background: rgba(180,90,255,.04) !important;
+        }
+        </style>
+    """, unsafe_allow_html=True)
 
 
 # ============================================================================
 # CACHED RESOURCE INITIALIZATION
 # ============================================================================
-# st.cache_resource ensures the Snowpark session, retriever, and LLM client
-# are created ONCE per server process (not on every rerun / every user
-# keystroke), which keeps the app fast and avoids exhausting Snowflake
-# connection limits.
 @st.cache_resource(show_spinner=False)
 def get_snowflake_session():
-    """
-    Creates a Snowpark session from environment variables:
-    SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, SNOWFLAKE_PASSWORD, SNOWFLAKE_ROLE,
-    SNOWFLAKE_WAREHOUSE, SNOWFLAKE_DATABASE, SNOWFLAKE_SCHEMA (see .env.example).
-    Credentials never touch application code -- they are injected purely
-    through the environment, which is a secure-by-default pattern for
-    enterprise deployments (Docker secrets, Kubernetes secrets, Streamlit
-    Community Cloud secrets, etc.).
-    """
-    return create_session_from_env()
-
+    key_path = os.getenv("SNOWFLAKE_PRIVATE_KEY_PATH", "rsa_key.p8")
+    with open(key_path, "rb") as key_file:
+        p_key = serialization.load_pem_private_key(
+            key_file.read(),
+            password=None
+        )
+    pkb = p_key.private_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+    connection_params = {
+        "account": os.getenv("SNOWFLAKE_ACCOUNT"),
+        "user": os.getenv("SNOWFLAKE_USER"),
+        "private_key": pkb,
+        "role": os.getenv("SNOWFLAKE_ROLE"),
+        "warehouse": os.getenv("SNOWFLAKE_WAREHOUSE"),
+        "database": os.getenv("SNOWFLAKE_DATABASE"),
+        "schema": os.getenv("SNOWFLAKE_SCHEMA"),
+    }
+    return Session.builder.configs(connection_params).create()
 
 @st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def get_retriever(_session):
-    """
-    Builds the Cortex Search retriever bound to the pre-existing
-    FINANCE_DB.DATA.FINANCE_SEARCH service. All indexing, embedding, and
-    similarity search happen server-side inside Snowflake -- this client
-    only ever sees the top-k text chunks that come back.
-    """
     return SnowflakeCortexSearchRetriever(
         session=_session,
         service_name=CORTEX_SEARCH_SERVICE,
         k=RETRIEVER_K,
+        database=os.getenv("SNOWFLAKE_DATABASE"),
+        schema=os.getenv("SNOWFLAKE_SCHEMA"),
+        text_column="chunk_text"
     )
-
 
 @st.cache_resource(show_spinner=False)
 def get_llm(_session):
-    """
-    Instantiates Claude 3.5 Sonnet via Snowflake Cortex. Because the model
-    is invoked through Cortex's COMPLETE function, inference happens inside
-    Snowflake's secure perimeter -- no raw document text is sent to a
-    third-party API outside the customer's Snowflake account.
-    """
     return ChatSnowflake(
         session=_session,
         model=CHAT_MODEL,
         temperature=MODEL_TEMPERATURE,
     )
 
-
 @st.cache_resource(show_spinner=False)
 def build_rag_chain(_session):
-    """
-    Assembles the full LCEL pipeline:
-
-        {"context": retriever, "question": RunnablePassthrough()}
-            | prompt
-            | llm
-            | StrOutputParser()
-
-    - The dict on the left runs both branches in parallel: the user's raw
-      question is sent to the retriever (context) and passed through
-      unchanged (question).
-    - The merged dict feeds the ChatPromptTemplate, which renders the
-      SYSTEM_PROMPT with the retrieved context injected, plus the user's
-      original question as the human turn.
-    - The rendered prompt goes to ChatSnowflake (Claude 3.5 Sonnet).
-    - StrOutputParser extracts a plain string from the AIMessage response
-      for easy rendering in Streamlit.
-    """
     retriever = get_retriever(_session)
     llm = get_llm(_session)
-
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system", SYSTEM_PROMPT),
-            ("human", "{question}"),
-        ]
-    )
-
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", SYSTEM_PROMPT),
+        ("human", "{question}"),
+    ])
     chain = (
         {"context": retriever, "question": RunnablePassthrough()}
         | prompt
@@ -203,47 +280,27 @@ def build_rag_chain(_session):
 # ============================================================================
 def render_sidebar():
     with st.sidebar:
-        st.title("⚙️ Configuration")
-        st.markdown("---")
+        st.markdown("<div class='sidebar-header'>System Architecture</div>", unsafe_allow_html=True)
 
-        st.subheader("Connection Status")
-
-        # Lazily attempt the Snowflake connection so the app can render
-        # even before credentials are verified, and so any auth errors
-        # are shown cleanly in the UI instead of crashing the whole app.
         try:
             session = get_snowflake_session()
             account = session.get_current_account()
-            warehouse = session.get_current_warehouse()
             role = session.get_current_role()
-            st.success("Connected to Snowflake")
-            st.markdown(f"**Account:** `{account}`")
-            st.markdown(f"**Warehouse:** `{warehouse}`")
-            st.markdown(f"**Role:** `{role}`")
-        except Exception as exc:  # noqa: BLE001 - surface any auth/connection error to the user
+            st.markdown(f"Account<br><span class='metric-value'>{account}</span>", unsafe_allow_html=True)
+            st.markdown(f"Active Role<br><span class='metric-value'>{role}</span>", unsafe_allow_html=True)
+            st.success("Connection Active")
+        except Exception as exc:
             session = None
-            st.error("Not connected to Snowflake")
-            with st.expander("Show error details"):
+            st.error("Connection Failed")
+            with st.expander("View Exception Details"):
                 st.code(str(exc))
 
-        st.markdown("---")
-        st.subheader("RAG Pipeline Settings")
-        st.markdown(f"**Search Service:**\n`{CORTEX_SEARCH_SERVICE}`")
-        st.markdown(f"**Retriever k:** `{RETRIEVER_K}`")
-        st.markdown(f"**Chat Model:** `{CHAT_MODEL}`")
-        st.markdown(f"**Temperature:** `{MODEL_TEMPERATURE}`")
-
-        st.markdown("---")
-        st.subheader("Security Note")
-        st.caption(
-            "All retrieval and generation calls execute inside your "
-            "Snowflake account boundary via Cortex Search and Cortex "
-            "COMPLETE. Financial documents are never sent to an external "
-            "vector store or third-party LLM API."
-        )
-
-        st.markdown("---")
-        if st.button("🗑️ Clear Chat History", use_container_width=True):
+        st.markdown("<div class='sidebar-header'>Engine Parameters</div>", unsafe_allow_html=True)
+        st.markdown(f"Search Service<br><span class='metric-value'>{CORTEX_SEARCH_SERVICE.split('.')[-1]}</span>", unsafe_allow_html=True)
+        st.markdown("Inference Model<br><span class='metric-value'>claude-3.5-sonnet</span>", unsafe_allow_html=True)
+        
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("Initialize New Session", use_container_width=True):
             st.session_state.messages = []
             st.rerun()
 
@@ -253,52 +310,48 @@ def render_sidebar():
 # ============================================================================
 # MAIN CHAT UI
 # ============================================================================
+# ============================================================================
+# MAIN CHAT UI
+# ============================================================================
+# ============================================================================
+# MAIN CHAT UI
+# ============================================================================
 def render_chat(session):
-    st.title(f"📊 {APP_TITLE}")
-    st.caption(
-        "Ask questions about your financial documents. Answers are grounded "
-        "exclusively in content retrieved from Snowflake Cortex Search."
-    )
+    st.markdown("<span class='eyebrow'>Enterprise RAG Interface</span>", unsafe_allow_html=True)
+    st.markdown("<h1 class='s-title'>Financial intelligence, <br><em>built to compound.</em></h1>", unsafe_allow_html=True)
+    st.markdown("<p class='lead'>Strict zero-trust retrieval running entirely within the warehouse boundary via Snowflake Cortex Search and Claude 3.5 Sonnet.</p>", unsafe_allow_html=True)
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    # Replay chat history
+    # Replay chat history (avatar parameter removed)
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    # New user input
-    user_question = st.chat_input("Ask a question about your financial documents...")
+    user_question = st.chat_input("Query enterprise financial documents...")
 
     if user_question:
         if session is None:
-            st.error(
-                "Cannot process your question: no active Snowflake session. "
-                "Check your credentials in the sidebar / .env file."
-            )
+            st.error("Authentication required. Verify Key-Pair credentials.")
             return
 
-        # Show and store the user's message
+        # Show user message (avatar parameter removed)
         st.session_state.messages.append({"role": "user", "content": user_question})
         with st.chat_message("user"):
             st.markdown(user_question)
 
-        # Run the RAG chain and stream the answer
+        # Generate and show assistant message (avatar parameter removed)
         with st.chat_message("assistant"):
-            with st.spinner("Searching financial documents and generating answer..."):
+            with st.spinner("Executing retrieval..."):
                 try:
                     rag_chain = build_rag_chain(session)
                     answer = rag_chain.invoke(user_question)
-                except Exception as exc:  # noqa: BLE001
-                    answer = (
-                        "⚠️ An error occurred while processing your question. "
-                        f"Details: `{exc}`"
-                    )
+                except Exception as exc:
+                    answer = f"[ System Exception ]\n\n`{exc}`"
                     traceback.print_exc(file=sys.stderr)
 
             st.markdown(answer)
-
         st.session_state.messages.append({"role": "assistant", "content": answer})
 
 
@@ -306,9 +359,9 @@ def render_chat(session):
 # ENTRYPOINT
 # ============================================================================
 def main():
+    inject_agency_css()
     session = render_sidebar()
     render_chat(session)
-
 
 if __name__ == "__main__":
     main()
