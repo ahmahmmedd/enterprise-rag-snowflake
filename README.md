@@ -1,4 +1,4 @@
-# 📊 Enterprise Financial Document RAG Assistant
+Enterprise Financial Document RAG Assistant
 
 **A secure, in-warehouse Retrieval-Augmented Generation (RAG) application for financial document Q&A — built with Streamlit, LangChain (LCEL), Snowflake Cortex Search, and Claude 3.5 Sonnet.**
 
